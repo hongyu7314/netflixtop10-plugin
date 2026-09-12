@@ -1,0 +1,16 @@
+{
+  "NetflixTop10": {
+    "name": "网飞排行榜",
+    "description": "Netflix 官方 Tudum Top 10 周榜订阅：全球/国家维度、剧集/电影四分类，TMDB 识别，一键订阅，新上榜提醒。",
+    "labels": "榜单,Netflix,剧集,电影",
+    "version": "1.0.0",
+    "icon": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png",
+    "author": "hongyu7314",
+    "level": 1,
+    "release": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首次发布：Netflix 官方 Tudum Top 10 周榜（全球 + 90+ 国家/地区），剧集/电影 × 英语/非英语四分类，TMDB 识别与三级缓存，一键订阅，新上榜提醒，自动订阅，订阅事件状态失效。"
+    }
+  }
+}
