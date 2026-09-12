@@ -47,33 +47,44 @@ except ImportError:  # 兼容旧版本
 
 
 def _create_meta_info(title: str, mtype: MediaType):
-    """创建 MoviePilot MetaInfo，兼容 TMDB chain/cache。"""
+    """创建 MoviePilot MetaInfo，兼容 V2/V3。
+
+    V3 同时存在两个 MetaInfo：
+      - app.schemas.MetaInfo: pydantic model，字段名 name/type，全部默认 None，可无参构造
+      - app.sdk.media.MetaInfo: 函数，必传位置参数 title，字段名 title/mtype（用于解析文件名/种子名）
+    优先使用 pydantic 版（与 MaoyanDianYing 等参考插件一致），失败兜底用函数版。
+    """
+    meta = None
+    last_err: Exception | None = None
+    # 优先 V3 pydantic 版（字段名 name= / type= 兼容老代码）
     try:
-        try:
-            from app.sdk.media import MetaInfo
-        except ImportError:
-            from app.schemas import MetaInfo
-        try:
-            meta = MetaInfo(name=title, type=mtype)
-        except Exception:
-            meta = MetaInfo()
-        for key, value in {
-            "name": title,
-            "title": title,
-            "original_name": title,
-            "type": mtype,
-        }.items():
-            try:
-                setattr(meta, key, value)
-            except Exception:
-                try:
-                    object.__setattr__(meta, key, value)
-                except Exception:
-                    pass
-        return meta
+        from app.schemas import MetaInfo as _MetaInfo
+        meta = _MetaInfo(name=title, type=mtype)
     except Exception as e:
-        logger.warning("创建 MoviePilot MetaInfo 失败: %s", e)
-        return None
+        last_err = e
+        # 兜底 V3 函数版（必传 title=，字段 mtype=）
+        try:
+            from app.sdk.media import MetaInfo as _MetaInfo
+            meta = _MetaInfo(title=title, mtype=mtype)
+        except Exception as e2:
+            last_err = e2
+            logger.warning("创建 MoviePilot MetaInfo 失败: %s", last_err)
+            return None
+    # 兜底 setattr，确保 name/title/type 都设上（不同版本字段名不同）
+    for key, value in {
+        "name": title,
+        "title": title,
+        "original_name": title,
+        "type": mtype,
+    }.items():
+        try:
+            setattr(meta, key, value)
+        except Exception:
+            try:
+                object.__setattr__(meta, key, value)
+            except Exception:
+                pass
+    return meta
 
 
 class TmdbHelper:
