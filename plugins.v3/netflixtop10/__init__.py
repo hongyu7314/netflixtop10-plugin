@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Body
@@ -115,11 +116,11 @@ class NetflixTop10(_PluginBase):
 
     plugin_name = "网飞排行榜"
     plugin_desc = (
-        "Netflix（Tudum Top 10）官方周榜订阅：全球/国家维度、剧集/电影四分类，"
-        "TMDB 识别，一键订阅，新上榜提醒，支持自动订阅。"
+        "Netflix（Tudum Top 10）官方周榜订阅：全球/中国香港/美国/韩国/日本五榜一键切换，"
+        "剧集/电影四分类，TMDB 识别，海报墙一键订阅，新上榜提醒，支持自动订阅。"
     )
     plugin_icon = "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "hongyu7314"
     author_url = "https://github.com/hongyu7314"
     plugin_config_prefix = "netflixtop10_"
@@ -133,6 +134,21 @@ class NetflixTop10(_PluginBase):
     _notified_key = "netflixtop10_notified"
     _refresh_interval = 6
     _fetch_lock = threading.Lock()
+    # 当前页面展示的地区 scope（独立于 plugin_config["rank_scope"]，
+    # 便于详情页快速切换而无需写入表单配置；详见 switch_region 接口）。
+    _view_scope = "global"
+
+    # ─── 快捷地区预设（详情页顶部一排按钮）───
+    # value 为插件内统一 scope 标识：
+    #   "global"   = 全球榜（使用 all-weeks-global.tsv）
+    #   其余字符串 = 国家/地区榜（使用 all-weeks-countries.tsv，按 country_match 模糊匹配）
+    PRESET_REGIONS: List[Dict[str, str]] = [
+        {"value": "global",        "label": "全球",   "icon": "mdi-earth"},
+        {"value": "Hong Kong",     "label": "中国香港", "icon": "mdi-flag-variant"},
+        {"value": "United States", "label": "美国",   "icon": "mdi-flag-variant"},
+        {"value": "South Korea",   "label": "韩国",   "icon": "mdi-flag-variant"},
+        {"value": "Japan",         "label": "日本",   "icon": "mdi-flag-variant"},
+    ]
 
     _tmdb_cache_ttl = 7 * 86400       # TMDB 搜索缓存 7 天
     _detail_cache_ttl = 7 * 86400     # TMDB 详情缓存 7 天
@@ -164,6 +180,14 @@ class NetflixTop10(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
         self._rank_scope = str(config.get("rank_scope", "global") or "global").strip() or "global"
+        # 恢复详情页上次切换的地区 scope（独立于表单配置）
+        self._view_scope = self._rank_scope
+        try:
+            cached_view = self.get_data("netflixtop10_view_scope")
+            if isinstance(cached_view, dict) and cached_view.get("scope"):
+                self._view_scope = str(cached_view["scope"]).strip() or self._rank_scope
+        except Exception:
+            pass
         cats = config.get("media_categories")
         self._media_categories = [c for c in (cats or []) if c in CATEGORY_MAP] or list(CATEGORY_ORDER)
         self._refresh_interval = int(config.get("refresh_interval", 6) or 6)
@@ -174,8 +198,9 @@ class NetflixTop10(_PluginBase):
         self._media_oper = MediaServerOper()
         self._transfer_oper = TransferHistoryOper()
         logger.info(
-            "【网飞排行】插件初始化：enabled=%s, scope=%s, categories=%s, interval=%sh",
-            self._enabled, self._rank_scope, self._media_categories, self._refresh_interval,
+            "【网飞排行】插件初始化：enabled=%s, scope=%s, view_scope=%s, categories=%s, interval=%sh",
+            self._enabled, self._rank_scope, self._view_scope,
+            self._media_categories, self._refresh_interval,
         )
 
         if config.get("run_once_flag"):
@@ -186,11 +211,18 @@ class NetflixTop10(_PluginBase):
 
         if self._enabled:
             cached = self.get_data(self._cache_key)
-            scope_changed = not (cached and isinstance(cached, dict)
-                                 and cached.get("scope") == self._rank_scope)
-            if not cached or not isinstance(cached, dict) or not cached.get("rows") or scope_changed:
+            # 如果上次详情页选定的地区跟缓存 scope 不一致（容器重启后常见），
+            # 启动时主动抓一次 view_scope 的数据
+            target_scope = self._view_scope
+            scope_mismatch = (not cached or not isinstance(cached, dict)
+                              or not cached.get("rows")
+                              or cached.get("scope") != target_scope)
+            if scope_mismatch:
                 threading.Thread(
-                    target=self._run_refresh_safe, name="NetflixTop10.InitialRefresh", daemon=True
+                    target=self._run_refresh_safe,
+                    kwargs={"notify": False, "scope": target_scope},
+                    name="NetflixTop10.InitialRefresh",
+                    daemon=True,
                 ).start()
             # 后台刷新国家列表（低频，7 天一次）
             threading.Thread(
@@ -249,6 +281,12 @@ class NetflixTop10(_PluginBase):
                 "endpoint": self.clear_cache,
                 "methods": ["GET"],
                 "summary": "清理插件缓存",
+            },
+            {
+                "path": "/switch-region",
+                "endpoint": self.switch_region,
+                "methods": ["GET"],
+                "summary": "切换详情页展示的地区榜单（全球/中国香港/美国/韩国/日本）",
             },
         ]
 
@@ -342,6 +380,8 @@ class NetflixTop10(_PluginBase):
                                 }, "text": (
                                     "数据来自 Netflix 官方 Tudum Top 10 周榜（每周二更新）；开启「新上榜提醒」后，"
                                     "每周榜单更新时推送新上榜片目并标注订阅状态；开启「自动订阅新上榜」会对新上榜且未订阅/未入库的片目自动添加订阅。"
+                                    "「榜单范围」仅决定默认抓取的地区；详情页顶部支持 5 个快捷地区一键切换（全球/中国香港/美国/韩国/日本），"
+                                    "切换后立即触发后台抓取（约 1-2 分钟）。"
                                     "国家榜单需下载较大数据文件，如获取失败请检查网络（可能需要代理）。"
                                 )}]},
                         ],
@@ -368,50 +408,338 @@ class NetflixTop10(_PluginBase):
         if not cached or not isinstance(cached, dict) or not cached.get("rows"):
             return [self._alert("暂无数据，首次启用会自动抓取，请稍后刷新页面；也可在设置中打开「保存后立即运行一次」。", "info")]
 
+        # ─── 当前页面 scope 与缓存 scope 解耦 ───
+        # 详情页支持 5 个快捷地区（全球/中国香港/美国/韩国/日本）。
+        # 缓存里的 scope 可能还是旧地区：若 view_scope 与 cache.scope 不同，
+        # 给出"切换中"提示并自动后台抓取新地区；不等抓取完成，先渲染旧缓存避免页面空白。
+        view_scope = getattr(self, "_view_scope", "global") or "global"
+        cache_scope = cached.get("scope") or "global"
+        cache_mismatched = view_scope != cache_scope
+
         rows = cached.get("rows", [])
-        scope_text = "全球" if cached.get("scope") == "global" else country_display_name(cached.get("scope", ""))
+        scope_text = "全球" if cache_scope == "global" else country_display_name(cache_scope)
+        view_text = "全球" if view_scope == "global" else country_display_name(view_scope)
         header_text = (
             f"榜单范围：{scope_text} ｜ 数据周期：{cached.get('week', '未知')} ｜ "
             f"共 {len(rows)} 条 ｜ 最后刷新：{cached.get('update_time', '未知')}"
         )
-        contents: list[dict] = [
-            {
-                "component": "VRow",
-                "props": {"class": "align-center mb-2", "no-gutters": True},
-                "content": [
-                    {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                        {"component": "VAlert", "props": {"type": "success", "variant": "tonal", "density": "compact"}, "text": header_text}]},
-                    {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                        {"component": "div", "props": {"class": "d-flex justify-end ga-2"},
-                         "content": [
-                             {"component": "VBtn", "props": {"size": "small", "color": "primary", "variant": "tonal", "text": "立即刷新"},
-                              "events": {"click": {"api": "plugin/NetflixTop10/run-once", "method": "get", "params": {"apikey": settings.API_TOKEN}}}},
-                             {"component": "VBtn", "props": {"size": "small", "color": "warning", "variant": "tonal", "text": "清理缓存"},
-                              "events": {"click": {"api": "plugin/NetflixTop10/clear-cache", "method": "get", "params": {"apikey": settings.API_TOKEN}}}},
-                         ]}]},
-                ],
-            },
-        ]
 
-        # 按分类分组渲染
+        contents: list[dict] = []
+
+        # ① 快捷地区切换条（5 个 toggle 按钮）
+        contents.append(self._render_region_switcher(view_scope))
+
+        # ② 顶部信息条 + 操作按钮
+        contents.append({
+            "component": "VRow",
+            "props": {"class": "align-center mb-2", "no-gutters": True},
+            "content": [
+                {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                    {"component": "VAlert",
+                     "props": {"type": "info" if cache_mismatched else "success",
+                               "variant": "tonal", "density": "compact"},
+                     "text": (
+                         header_text if not cache_mismatched else
+                         f"已切换至「{view_text}」榜，正在后台抓取（约 1-2 分钟），"
+                         f"抓取完成前展示上次缓存：{scope_text} {cached.get('week', '')}"
+                     )}]},
+                {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                    {"component": "div", "props": {"class": "d-flex justify-end ga-2"},
+                     "content": [
+                         {"component": "VBtn",
+                          "props": {"size": "small", "color": "primary", "variant": "tonal",
+                                    "text": "立即刷新"},
+                          "events": {"click": {"api": "plugin/NetflixTop10/run-once",
+                                               "method": "get",
+                                               "params": {"apikey": settings.API_TOKEN}}}},
+                         {"component": "VBtn",
+                          "props": {"size": "small", "color": "warning", "variant": "tonal",
+                                    "text": "清理缓存"},
+                          "events": {"click": {"api": "plugin/NetflixTop10/clear-cache",
+                                               "method": "get",
+                                               "params": {"apikey": settings.API_TOKEN}}}},
+                     ]}]},
+            ],
+        })
+
+        # ③ 每个分类一张海报墙
         for cat in CATEGORY_ORDER:
             cat_rows = [r for r in rows if r.get("category") == cat]
             if not cat_rows:
                 continue
-            card_content: list[dict] = [
-                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                 "text": f"{CATEGORY_ZH.get(cat, cat)} · {cached.get('week', '')}"},
-                {"component": "VDivider"},
-                {"component": "VCardText", "props": {"class": "pa-2"}, "content": []},
-            ]
-            card_rows = card_content[2]["content"]
-            for item in cat_rows:
-                card_rows.append(self._render_item_row(item))
-            contents.append({"component": "VCard", "props": {"class": "mb-3"}, "content": card_content})
+            contents.append(self._render_category_section(cat, cat_rows, cached.get("week", "")))
+
         return contents
 
+    def _render_region_switcher(self, current: str) -> dict:
+        """渲染详情页顶部 5 个快捷地区按钮。"""
+        btn_items: list[dict] = []
+        for region in self.PRESET_REGIONS:
+            value = region["value"]
+            is_active = (value == current)
+            btn_items.append({
+                "component": "VBtn",
+                "props": {
+                    "size": "small",
+                    "variant": "elevated" if is_active else "tonal",
+                    "color": "primary" if is_active else "default",
+                    "class": "ma-1",
+                    "prepend-icon": region["icon"],
+                    "text": region["label"],
+                },
+                "events": ({"click": {
+                    "api": "plugin/NetflixTop10/switch-region",
+                    "method": "get",
+                    "params": {"scope": value, "apikey": settings.API_TOKEN},
+                }} if not is_active else {}),
+            })
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-3", "variant": "outlined"},
+            "content": [
+                {"component": "VCardText", "props": {"class": "pa-3"}, "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center flex-wrap ga-1"},
+                     "content": [
+                         {"component": "span",
+                          "props": {"class": "text-subtitle-2 mr-3 font-weight-bold"},
+                          "text": "切换榜单地区："},
+                         *btn_items,
+                     ]},
+                ]},
+            ],
+        }
+
+    def _render_category_section(self, cat: str, cat_rows: list, week: str) -> dict:
+        """渲染单个分类的海报墙（响应式 6/4/3/2 列网格）。"""
+        cards: list[dict] = []
+        for item in cat_rows:
+            cards.append({
+                "component": "VCol",
+                "props": {"cols": 6, "sm": 4, "md": 3, "lg": 2},
+                "content": [self._render_poster_card(item)],
+            })
+
+        return {
+            "component": "VCard",
+            "props": {"class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "d-flex align-center text-subtitle-1 pb-2"},
+                 "content": [
+                     {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
+                      "text": "mdi-fire"},
+                     {"component": "span", "text": f"{CATEGORY_ZH.get(cat, cat)} · {week}"},
+                     {"component": "VSpacer"},
+                     {"component": "VChip", "props": {"size": "x-small", "color": "primary",
+                                                      "variant": "tonal"},
+                      "text": f"TOP {len(cat_rows)}"},
+                 ]},
+                {"component": "VDivider"},
+                {"component": "VCardText", "props": {"class": "pa-3"}, "content": [
+                    {"component": "VRow", "props": {"no-gutters": True, "dense": True},
+                     "content": cards},
+                ]},
+            ],
+        }
+
+    def _render_poster_card(self, item: dict) -> dict:
+        """渲染单个海报卡片：海报 + 状态徽章 + 标题 + 订阅按钮。
+
+        卡片整体是 <a href="#/media?...">，点击即在 SPA 内跳转到 MoviePilot 系统详情页；
+        下方订阅按钮 stop-propagation 防止点击穿透。
+        """
+        tmdbid = item.get("tmdbid") or 0
+        name = item.get("name", "")
+        zh_name = item.get("zh_name") or ""
+        display_name = zh_name or name
+        mtype = item.get("mtype", "TV")
+        year = item.get("year", "")
+        season = item.get("season", "")
+
+        # 计算订阅/入库状态（缓存 30 分钟）
+        status = item.get("status") or self._check_media_status(tmdbid, name, mtype)
+        item["status"] = status
+
+        poster = item.get("poster") or ""
+        rank = item.get("rank", 0)
+        weeks = item.get("weeks_in_top10", 0)
+        views = item.get("views") or 0
+        hours = item.get("hours_viewed") or 0
+
+        # 状态颜色 + 文字
+        status_color_map = {
+            "影片已入库": "success",
+            "订阅已添加": "info",
+            "未添加订阅": "default",
+        }
+        status_color = status_color_map.get(status, "default")
+
+        # 副标题：原名（如果有中文）/ 年份 / 季 / 上榜周数
+        sub_parts: list[str] = []
+        if zh_name and name and zh_name != name:
+            sub_parts.append(name)
+        if year:
+            sub_parts.append(str(year))
+        if season:
+            sub_parts.append(season)
+        if weeks:
+            sub_parts.append(f"上榜{weeks}周")
+        sub_line = " · ".join(sub_parts)
+
+        # 观看数据
+        if views:
+            views_line = f"周观看 {format_count(views)} 次"
+        elif hours:
+            views_line = f"周观看 {format_count(hours)} 小时"
+        else:
+            views_line = ""
+
+        # 系统详情页 URL（仅当有 TMDB ID 时可点击）
+        media_url = ""
+        if tmdbid:
+            media_url = (
+                f"#/media?media_source=themoviedb&media_id={tmdbid}"
+                f"&title={quote(display_name)}"
+                f"&year={year or ''}"
+                f"&type={'电影' if mtype == 'MOVIE' else '电视剧'}"
+            )
+
+        # 海报区（160x240，与猫眼海报墙一致）
+        poster_inner: list[dict] = []
+        if poster:
+            poster_inner.append({
+                "component": "VImg",
+                "props": {
+                    "src": poster,
+                    "max-width": "160",
+                    "max-height": "240",
+                    "aspect-ratio": "2/3",
+                    "cover": True,
+                    "class": "rounded netflix-poster-img",
+                    "style": "height:auto; width:100%;",
+                },
+            })
+        else:
+            poster_inner.append({
+                "component": "div",
+                "props": {
+                    "class": "rounded bg-grey-lighten-2 d-flex align-center justify-center",
+                    "style": "aspect-ratio:2/3; width:100%;",
+                },
+                "content": [
+                    {"component": "VIcon", "props": {"size": "large", "color": "grey"},
+                     "text": "mdi-image-off-outline"},
+                ],
+            })
+        # 排名标签（左上角）
+        poster_inner.insert(0, {
+            "component": "VChip",
+            "props": {
+                "size": "x-small",
+                "color": "primary",
+                "variant": "elevated",
+                "class": "netflix-rank-chip",
+                "style": "position:absolute; top:6px; left:6px; z-index:2;",
+            },
+            "text": f"No.{rank}",
+        })
+        # 状态徽章（底部）
+        poster_inner.append({
+            "component": "div",
+            "props": {
+                "class": f"netflix-status-bar text-white text-center",
+                "style": (
+                    "position:absolute; bottom:0; left:0; right:0;"
+                    f" background:var(--v-theme-{status_color}, #555);"
+                    " font-size:10px; padding:2px 0;"
+                    " border-bottom-left-radius:4px; border-bottom-right-radius:4px;"
+                ),
+            },
+            "text": status,
+        })
+
+        # 卡片信息区：标题 + 副标题 + 数据 + 订阅按钮
+        info_content: list[dict] = [
+            {"component": "div",
+             "props": {"class": "text-body-2 font-weight-bold mt-2 text-truncate",
+                       "style": "line-height:1.3;"},
+             "text": display_name or name},
+        ]
+        if sub_line:
+            info_content.append({
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis text-truncate"},
+                "text": sub_line,
+            })
+        if views_line:
+            info_content.append({
+                "component": "div",
+                "props": {"class": "text-caption text-medium-emphasis"},
+                "text": views_line,
+            })
+
+        # 订阅按钮：未订阅且有 TMDB ID 时可点击
+        can_sub = (status == "未添加订阅" and tmdbid)
+        sub_btn = {
+            "component": "VBtn",
+            "props": {
+                "size": "x-small",
+                "color": "primary" if can_sub else "default",
+                "variant": "elevated" if can_sub else "tonal",
+                "block": True,
+                "class": "mt-2",
+                "text": "订阅" if can_sub else status,
+                "disabled": not can_sub,
+            },
+        }
+        if can_sub:
+            sub_btn["events"] = {"click": {
+                "api": "plugin/NetflixTop10/subscribe",
+                "method": "get",
+                "params": {
+                    "tmdbid": tmdbid,
+                    "name": name,
+                    "mtype": mtype,
+                    "apikey": settings.API_TOKEN,
+                },
+            }}
+        info_content.append(sub_btn)
+
+        # 整个卡片包成 <a> 点击进系统详情（如果有 TMDB ID），否则普通 VCard
+        inner = {
+            "component": "VCard",
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "class": "netflix-poster-card h-100",
+                "style": "cursor:pointer; transition: transform .15s, box-shadow .15s;",
+            },
+            "content": [
+                # 海报区域（用 div 包住以便 absolute 定位徽章）
+                {"component": "div",
+                 "props": {"style": "position:relative;", "class": "netflix-poster-wrap"},
+                 "content": poster_inner},
+                # 文字 + 按钮区
+                {"component": "VCardText",
+                 "props": {"class": "pa-2 pt-1"},
+                 "content": info_content},
+            ],
+        }
+        if media_url:
+            # 用 <a> 包整个卡片 → SPA 内跳系统详情
+            return {
+                "component": "a",
+                "props": {
+                    "href": media_url,
+                    "rel": "noopener noreferrer",
+                    "class": "d-block text-decoration-none text-high-emphasis netflix-poster-link",
+                    "style": "color:inherit;",
+                },
+                "content": [inner],
+            }
+        return inner
+
     def _render_item_row(self, item: dict) -> dict:
-        """渲染单个榜单条目行。"""
+        """渲染单个榜单条目行（保留旧版紧凑行模式，供历史兼容/未来调试使用）。"""
         status = item.get("status") or self._check_media_status(
             item.get("tmdbid", 0), item.get("name", ""), item.get("mtype", "TV")
         )
@@ -444,13 +772,11 @@ class NetflixTop10(_PluginBase):
             }} if poster else {"component": "div", "props": {
                 "style": "width:40px;height:60px;", "class": "rounded bg-grey-lighten-2"}}]}
 
-        # 状态徽章
         status_color = {"影片已入库": "success", "订阅已添加": "info"}.get(status, "default")
         status_chip = {"component": "VChip", "props": {
             "size": "x-small", "variant": "tonal", "color": status_color,
         }, "text": status}
 
-        # 订阅按钮：未订阅且有 TMDB ID 时可点击
         can_sub = status == "未添加订阅" and item.get("tmdbid")
         sub_btn = {"component": "VBtn", "props": {
             "size": "x-small", "color": "primary", "variant": "tonal",
@@ -545,18 +871,21 @@ class NetflixTop10(_PluginBase):
             pass
         return None
 
-    def _run_refresh_safe(self, notify: bool = True):
-        """带锁的刷新入口（线程安全）。"""
+    def _run_refresh_safe(self, notify: bool = True, scope: Optional[str] = None):
+        """带锁的刷新入口（线程安全）。scope=None 用 self._rank_scope。"""
         with self._fetch_lock:
             try:
-                self._auto_refresh(notify=notify)
+                self._auto_refresh(notify=notify, scope=scope)
             except Exception as e:
                 logger.error("【网飞排行】刷新失败: %s", e)
 
-    def _auto_refresh(self, notify: bool = True):
-        """核心刷新：抓取榜单 -> TMDB 识别 -> 更新缓存 -> 新上榜通知。"""
-        logger.info("【网飞排行】开始刷新，scope=%s", self._rank_scope)
-        scope = self._rank_scope
+    def _auto_refresh(self, notify: bool = True, scope: Optional[str] = None):
+        """核心刷新：抓取榜单 -> TMDB 识别 -> 更新缓存 -> 新上榜通知。
+
+        :param scope: 临时覆盖榜单范围（None 表示用 self._rank_scope）。
+        """
+        scope = (scope or self._rank_scope or "global").strip() or "global"
+        logger.info("【网飞排行】开始刷新，scope=%s", scope)
         country = None if scope == "global" else scope
         urls = self.GLOBAL_URLS if country is None else self.COUNTRIES_URLS
 
@@ -569,7 +898,7 @@ class NetflixTop10(_PluginBase):
         if countries:
             self.save_data(self._countries_key, {"countries": countries, "ts": time.time()})
 
-        # 与旧缓存合并：已识别的 TMDB 信息直接复用
+        # 与旧缓存合并：已识别的 TMDB 信息直接复用（仅当 scope 一致时）
         cached = self.get_data(self._cache_key)
         existing: Dict[str, dict] = {}
         if cached and isinstance(cached, dict) and cached.get("scope") == scope:
@@ -608,7 +937,12 @@ class NetflixTop10(_PluginBase):
             "timestamp": time.time(),
         }
         self.save_data(self._cache_key, result)
-        logger.info("【网飞排行】刷新完成，周期 %s 共 %d 条（新识别 TMDB %d 条）", week, len(enriched), new_tmdb_count)
+        logger.info("【网飞排行】刷新完成，scope=%s 周期 %s 共 %d 条（新识别 TMDB %d 条）",
+                    scope, week, len(enriched), new_tmdb_count)
+
+        # 刷新成功后同步更新 view_scope，使详情页立刻与缓存一致
+        self._view_scope = scope
+        self.save_data("netflixtop10_view_scope", {"scope": scope, "ts": time.time()})
 
         if notify:
             self._notify_new_entries(enriched, scope, week)
@@ -976,7 +1310,7 @@ class NetflixTop10(_PluginBase):
             return {"success": False, "message": "API密钥错误"}
         start = time.time()
         try:
-            self._auto_refresh(notify=True)
+            self._auto_refresh(notify=True, scope=self._view_scope)
             cached = self.get_data(self._cache_key) or {}
             elapsed = round(time.time() - start, 1)
             return {
@@ -987,6 +1321,48 @@ class NetflixTop10(_PluginBase):
         except Exception as e:
             logger.error("【网飞排行】立即运行失败：%s", e)
             return {"success": False, "message": str(e)}
+
+    def switch_region(self, scope: str = "", apikey: str = None):
+        """API：切换详情页展示的地区榜单。
+
+        立即更新 view_scope 并启动后台线程抓取新地区数据；
+        当前缓存（旧地区）保留供过渡展示，前端刷新页面即可看到新地区。
+        """
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        scope = (scope or "").strip() or "global"
+        # 合法性校验：必须是 5 个预设之一，否则用 global
+        valid_values = {r["value"] for r in self.PRESET_REGIONS}
+        if scope not in valid_values:
+            scope = "global"
+        label = next((r["label"] for r in self.PRESET_REGIONS if r["value"] == scope), scope)
+        cached = self.get_data(self._cache_key)
+        already = (cached and isinstance(cached, dict)
+                   and cached.get("scope") == scope
+                   and cached.get("rows"))
+        # 先更新 view_scope + 持久化，让 get_page 立刻反映新选择
+        self._view_scope = scope
+        self.save_data("netflixtop10_view_scope", {"scope": scope, "ts": time.time()})
+        if already:
+            logger.info("【网飞排行】切换地区 %s：缓存已存在，跳过抓取", label)
+            return {
+                "success": True,
+                "message": f"已切换至「{label}」榜，缓存有效（周期 {cached.get('week', '未知')}）",
+                "data": {"scope": scope, "week": cached.get("week", ""), "from_cache": True},
+            }
+        # 后台抓取新地区
+        logger.info("【网飞排行】切换地区 %s：启动后台抓取", label)
+        threading.Thread(
+            target=self._run_refresh_safe,
+            kwargs={"notify": False, "scope": scope},
+            name=f"NetflixTop10.SwitchRegion.{scope}",
+            daemon=True,
+        ).start()
+        return {
+            "success": True,
+            "message": f"已切换至「{label}」榜，正在后台抓取（约 1-2 分钟），请稍后刷新页面",
+            "data": {"scope": scope, "week": "", "from_cache": False},
+        }
 
     def get_cache(self, apikey: str = None):
         """API：获取缓存数据（每次重算订阅状态）。"""
