@@ -1,0 +1,9 @@
+# 插件以 LF 换行入库：Windows 下 core.autocrlf=true 会把检出内容转成 CRLF，
+# 而插件最终部署到 Linux 容器，统一强制 LF 避免换行符在两侧来回变换。
+* text=auto eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.tsv text eol=lf
+*.png binary
+*.jpg binary
