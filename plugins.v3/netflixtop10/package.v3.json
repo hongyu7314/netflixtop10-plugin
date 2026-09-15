@@ -2,7 +2,7 @@
   "PluginID": "NetflixTop10",
   "Name": "网飞排行榜",
   "Module": "plugins.v3.netflixtop10",
-  "Version": "1.1.1",
+  "Version": "1.1.2",
   "Author": "hongyu7314",
   "Description": "Netflix 官方 Tudum Top 10 周榜订阅：详情页顶部一键切换全球/中国香港/美国/韩国/日本五榜，海报墙点卡片直接跳转 MoviePilot 系统详情页，支持剧集/电影×英语/非英语四个分类，TMDB 识别，一键订阅，新上榜提醒，自动订阅。",
   "AuthorLink": "https://github.com/hongyu7314",
