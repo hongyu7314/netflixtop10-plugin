@@ -88,6 +88,128 @@ def _create_meta_info(title: str, mtype: MediaType):
     return meta
 
 
+# Netflix 榜单名里常见的副标题后缀：Season X / Part X / Chapter X / Vol X / Book X / (YYYY)
+_NETFLIX_SUFFIX_RE = re.compile(
+    r"\s*[,:]\s*(?:Season|Part|Chapter|Vol\.?|Volume|Book|Series|Film|Movie|Collection)\s+\d+\b.*$",
+    re.IGNORECASE,
+)
+_NETFLIX_YEAR_RE = re.compile(r"\s*\(\d{4}\)\s*$")
+
+
+def _clean_netflix_title(title: str) -> str:
+    """剥离 Netflix 榜单标题中的季/部/年份后缀，得到更利于 TMDB 搜索的干净名字。"""
+    if not title:
+        return ""
+    cleaned = _NETFLIX_SUFFIX_RE.sub("", title)
+    cleaned = _NETFLIX_YEAR_RE.sub("", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_title_for_compare(t: str) -> str:
+    """忽略大小写/空白/常见标点，用于"完全一致"匹配。"""
+    if not t:
+        return ""
+    # 去掉所有非字母数字字符，转小写；中文等非拉丁字符保留
+    return re.sub(r"[\s\-_:'\",.!?()\[\]{}&/\\|+@#$%^*~`]", "", t).lower()
+
+
+_TMDB_LOOSE_RECENT_DAYS = 730  # 宽松兜底时判定"近期发行"的窗口：Netflix 周榜以新片为主
+
+
+def _as_float(value: Any) -> float:
+    """把 TMDB 返回的数值字段安全转成 float。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _item_release_date(item: dict) -> Optional[datetime]:
+    """取出 TMDB 搜索结果的上映/首播日期，缺失或非法时返回 None。"""
+    raw = str(item.get("release_date") or item.get("first_air_date") or "")[:10]
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _pick_best_tmdb_match(
+    title: str, items: List[dict], media_type: MediaType, strict: bool = False
+) -> int:
+    """从 TMDB 搜索结果里挑最可能对应 Netflix 条目的那一个 id。
+
+    优先级：
+      1. original_title / original_name 与输入完全一致（忽略大小写/标点）
+      2. title / name 完全一致
+      3. original_title 与输入互为子串（取长度最接近的一条）
+      4. title / name 与输入互为子串（取长度最接近的一条）
+      5. 宽松兜底：优先 TMDB 相关性第一条；若存在"近期发行且热度更高"的候选则替换
+
+    strict=True 时只做 1~4 的"标题确实对得上"判断，不做第 5 步兜底，
+    避免把毫不相关的热门结果当成目标（例如 "The Gentlemen" 命中 "The Gentlemen's Hentai Club"）。
+
+    第 5 步的"近期 + 更热门"替换规则，针对的是这类真实错误：
+      "The Secret Woman" 的相关性第一条是 2015 年的 Shakespeare's Mother，
+      而正确的《她的秘密人生》(2026-08-28) 排在第二条且热度高出一个量级。
+    """
+    if not items:
+        return 0
+    title_field = "title" if media_type == MediaType.MOVIE else "name"
+    original_field = "original_title" if media_type == MediaType.MOVIE else "original_name"
+    needle = _normalize_title_for_compare(title)
+    if not needle:
+        return 0
+
+    # 1) original 完全匹配
+    for it in items:
+        if _normalize_title_for_compare(it.get(original_field) or "") == needle:
+            return int(it.get("id") or 0)
+    # 2) 本地化 title 完全匹配
+    for it in items:
+        if _normalize_title_for_compare(it.get(title_field) or "") == needle:
+            return int(it.get("id") or 0)
+
+    def substring_hit(field: str) -> int:
+        """互为子串的候选里取长度最接近的，避免 "Graveyard" 被 "Graveyard Carz" 抢先命中。"""
+        best_diff: Optional[int] = None
+        best_id = 0
+        for it in items:
+            cand = _normalize_title_for_compare(it.get(field) or "")
+            if not cand or not (needle in cand or cand in needle):
+                continue
+            diff = abs(len(cand) - len(needle))
+            if best_diff is None or diff < best_diff:
+                best_diff, best_id = diff, int(it.get("id") or 0)
+        return best_id
+
+    # 3) original 互为子串（处理 Netflix 加了 ": Season 2" 等副标题）
+    hit = substring_hit(original_field)
+    if hit:
+        return hit
+    # 4) 本地化 title 互为子串
+    hit = substring_hit(title_field)
+    if hit:
+        return hit
+    if strict:
+        return 0
+
+    # 5) 宽松兜底：TMDB 相关性第一条为基准，只被"更近期发行且更热门"的候选顶替
+    pool = [it for it in items if it.get("poster_path")] or list(items)
+    best = pool[0]
+    best_pop = _as_float(best.get("popularity"))
+    now = datetime.now()
+    for it in pool[1:]:
+        released = _item_release_date(it)
+        if not released or (now - released).days > _TMDB_LOOSE_RECENT_DAYS:
+            continue
+        pop = _as_float(it.get("popularity"))
+        if pop > best_pop:
+            best, best_pop = it, pop
+    return int(best.get("id") or 0)
+
+
 class TmdbHelper:
     """TMDB 数据辅助器（使用 MoviePilot 内置 TMDB API）。"""
 
@@ -120,7 +242,7 @@ class NetflixTop10(_PluginBase):
         "剧集/电影四分类，TMDB 识别，海报墙一键订阅，新上榜提醒，支持自动订阅。"
     )
     plugin_icon = "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "hongyu7314"
     author_url = "https://github.com/hongyu7314"
     plugin_config_prefix = "netflixtop10_"
@@ -966,8 +1088,9 @@ class NetflixTop10(_PluginBase):
 
     @staticmethod
     def _tmdb_cache_key(title: str, mtype: str) -> str:
+        # 命名空间带版本号：识别策略变更时 bump，可一次性作废历史错误缓存
         md5 = hashlib.md5(f"{mtype}::{title}".encode("utf-8")).hexdigest()[:12]
-        return f"netflixtop10_tmdb_{md5}"
+        return f"netflixtop10_tmdb_v2_{md5}"
 
     def _get_cached(self, key: str, ttl: int) -> Optional[Any]:
         try:
@@ -986,7 +1109,7 @@ class NetflixTop10(_PluginBase):
             pass
 
     def _search_tmdb_with_cache(self, title: str, mtype: str) -> Optional[dict]:
-        """带 7 天缓存的 TMDB 识别：优先宿主识别链，回退 TmdbApi 直接搜索。"""
+        """带 7 天缓存的 TMDB 识别：优先严格标题搜索，回退宿主识别链，最后宽松兜底。"""
         if not title:
             return None
         cache_key = self._tmdb_cache_key(title, mtype)
@@ -996,36 +1119,68 @@ class NetflixTop10(_PluginBase):
 
         media_type = MediaType.MOVIE if mtype == "MOVIE" else MediaType.TV
         tmdb_id = 0
-        zh_name = ""
-        # 1. 宿主识别链（利用宿主 TMDB 缓存与别名匹配）
-        try:
-            meta = _create_meta_info(title, media_type)
-            if meta:
-                media_info = self.chain.recognize_media(meta=meta, cache=True)
-                if media_info and getattr(media_info, "tmdb_id", None):
-                    source = str(getattr(media_info, "media_source", "") or "").lower()
-                    if not source or source in ("themoviedb", "tmdb"):
-                        tmdb_id = int(getattr(media_info, "tmdb_id"))
-        except Exception as e:
-            logger.debug("【网飞排行】识别链识别 '%s' 失败：%s", title, e)
 
-        # 2. 回退 TmdbApi 搜索
-        if not tmdb_id:
+        candidates: List[str] = [title]
+        cleaned = _clean_netflix_title(title)
+        if cleaned and cleaned != title:
+            candidates.append(cleaned)
+
+        # 1. 底层 Search 客户端直接调用 + 严格标题匹配。
+        #    刻意绕开 TmdbApi._project_search_results：它用 `查询词 in item["name"]` 过滤，
+        #    而 language=zh 时 item["name"] 是中文名（"绅士们"/"怪物史瑞克"），
+        #    英文榜单标题永远不可能是其子串 —— 结果会被整批过滤掉（曾导致 40 条只认出 11 条）。
+        probed: List[tuple] = []
+        for cand_title in candidates:
             try:
                 api = TmdbHelper.api()
                 if media_type == MediaType.MOVIE:
-                    result = api.search_movies(title, "")
+                    raw_results = list(api.search.movies(term=cand_title) or [])
                 else:
-                    result = api.search_tvs(title, "")
-                if result:
-                    tmdb_id = int(result[0].get("id") or 0)
+                    raw_results = list(api.search.tv_shows(term=cand_title) or [])
             except Exception as e:
-                logger.debug("【网飞排行】TMDB 搜索 '%s' 失败：%s", title, e)
+                logger.debug("【网飞排行】TMDB 底层搜索 '%s' 失败：%s", cand_title, e)
+                raw_results = []
+            probed.append((cand_title, raw_results))
+            if not raw_results:
+                continue
+            matched = _pick_best_tmdb_match(cand_title, raw_results, media_type, strict=True)
+            if matched:
+                tmdb_id = matched
+                if cand_title != title:
+                    logger.info(
+                        "【网飞排行】'%s' 未直接命中，已用清理后标题 '%s' 匹配到 TMDB %s",
+                        title, cand_title, tmdb_id,
+                    )
+                break
+
+        # 2. 回退：宿主识别链（利用宿主 TMDB 缓存与中文别名匹配）
+        if not tmdb_id:
+            try:
+                meta = _create_meta_info(title, media_type)
+                if meta:
+                    media_info = self.chain.recognize_media(meta=meta, cache=True)
+                    if media_info and getattr(media_info, "tmdb_id", None):
+                        source = str(getattr(media_info, "media_source", "") or "").lower()
+                        if not source or source in ("themoviedb", "tmdb"):
+                            tmdb_id = int(getattr(media_info, "tmdb_id"))
+            except Exception as e:
+                logger.debug("【网飞排行】识别链识别 '%s' 失败：%s", title, e)
+
+        # 3. 最后兜底：宽松取第一个带海报的候选（复用第 1 步已抓到的结果，不重复请求）
+        if not tmdb_id:
+            for cand_title, raw_results in probed:
+                if not raw_results:
+                    continue
+                tmdb_id = _pick_best_tmdb_match(cand_title, raw_results, media_type)
+                if tmdb_id:
+                    logger.info("【网飞排行】'%s' 无严格命中，宽松匹配到 TMDB %s", title, tmdb_id)
+                    break
 
         if not tmdb_id:
+            logger.warning("【网飞排行】TMDB 未匹配到 '%s'（%s）", title, mtype)
             return None
 
-        # 3. 详情（海报/日期/中文名），7 天缓存
+        # 4. 详情（海报/日期/中文名），7 天缓存
         detail_key = f"netflixtop10_detail_{mtype}_{tmdb_id}"
         detail = self._get_cached(detail_key, self._detail_cache_ttl)
         if not detail:
