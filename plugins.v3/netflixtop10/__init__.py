@@ -243,7 +243,7 @@ class NetflixTop10(_PluginBase):
         "剧集/电影四分类，TMDB 识别，海报墙一键订阅，新上榜提醒，支持自动订阅。"
     )
     plugin_icon = "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_author = "hongyu7314"
     author_url = "https://github.com/hongyu7314"
     plugin_config_prefix = "netflixtop10_"
@@ -667,8 +667,17 @@ class NetflixTop10(_PluginBase):
     def _render_poster_card(self, item: dict) -> dict:
         """渲染单个海报卡片：海报 + 状态徽章 + 标题 + 订阅按钮。
 
-        卡片整体是 <a href="#/media?...">，点击即在 SPA 内跳转到 MoviePilot 系统详情页；
-        下方订阅按钮 stop-propagation 防止点击穿透。
+        结构（很重要）：
+          VCard
+            ├─ <a href="#/media?...">   ← 只有"海报 + 文字"是跳详情的热区
+            │    ├─ 海报区（含排名/状态徽章）
+            │    └─ 标题/副标题/观看数据
+            └─ 订阅按钮（在 <a> 之外）
+
+        ⚠️ 订阅按钮**不能**放进 <a> 内。MoviePilot 插件页由前端 PageRender 统一绑定
+        events.click，其 commonAction 不调用 preventDefault/stopPropagation，
+        因此 <a> 内部的按钮点击会冒泡激活链接 —— 表现为"点订阅也跳到/弹出媒体详情页、
+        且看不到订阅结果反馈"。把按钮移出 <a> 是唯一可靠的做法（配置层无法阻止冒泡）。
         """
         tmdbid = item.get("tmdbid") or 0
         name = item.get("name", "")
@@ -717,13 +726,15 @@ class NetflixTop10(_PluginBase):
             views_line = ""
 
         # 系统详情页 URL（仅当有 TMDB ID 时可点击）
+        # query 键名与 MoviePilot v3 前端 /media 路由的 props 映射一致：
+        # media_source→mediaSource、media_id→mediaId、title、year、type（电影/电视剧）
         media_url = ""
         if tmdbid:
             media_url = (
                 f"#/media?media_source=themoviedb&media_id={tmdbid}"
                 f"&title={quote(display_name)}"
                 f"&year={year or ''}"
-                f"&type={'电影' if mtype == 'MOVIE' else '电视剧'}"
+                f"&type={quote('电影' if mtype == 'MOVIE' else '电视剧')}"
             )
 
         # 海报区（160x240，与猫眼海报墙一致）
@@ -800,17 +811,29 @@ class NetflixTop10(_PluginBase):
                 "text": views_line,
             })
 
-        # 订阅按钮：未订阅且有 TMDB ID 时可点击
+        # 订阅按钮：未订阅且有 TMDB ID 时可点击。
+        # 注意：按钮渲染在 <a> 之外（见下方卡片结构），避免点击穿透到详情页链接。
         can_sub = (status == "未添加订阅" and tmdbid)
+        if can_sub:
+            btn_text, btn_color, btn_icon = "订阅", "primary", "mdi-plus-circle-outline"
+        elif not tmdbid:
+            btn_text, btn_color, btn_icon = "未识别 TMDB", "default", "mdi-help-circle-outline"
+        elif status == "订阅已添加":
+            btn_text, btn_color, btn_icon = status, "info", "mdi-check-circle-outline"
+        elif status == "影片已入库":
+            btn_text, btn_color, btn_icon = status, "success", "mdi-check-circle-outline"
+        else:
+            btn_text, btn_color, btn_icon = status, "default", "mdi-information-outline"
         sub_btn = {
             "component": "VBtn",
             "props": {
                 "size": "x-small",
-                "color": "primary" if can_sub else "default",
+                "color": btn_color,
                 "variant": "elevated" if can_sub else "tonal",
                 "block": True,
-                "class": "mt-2",
-                "text": "订阅" if can_sub else status,
+                "class": "mt-1",
+                "prepend-icon": btn_icon,
+                "text": btn_text,
                 "disabled": not can_sub,
             },
         }
@@ -825,31 +848,27 @@ class NetflixTop10(_PluginBase):
                     "apikey": settings.API_TOKEN,
                 },
             }}
-        info_content.append(sub_btn)
 
-        # 整个卡片包成 <a> 点击进系统详情（如果有 TMDB ID），否则普通 VCard
-        inner = {
-            "component": "VCard",
-            "props": {
-                "variant": "outlined",
-                "rounded": "lg",
-                "class": "netflix-poster-card h-100",
-                "style": "cursor:pointer; transition: transform .15s, box-shadow .15s;",
-            },
-            "content": [
-                # 海报区域（用 div 包住以便 absolute 定位徽章）
-                {"component": "div",
-                 "props": {"style": "position:relative;", "class": "netflix-poster-wrap"},
-                 "content": poster_inner},
-                # 文字 + 按钮区
-                {"component": "VCardText",
-                 "props": {"class": "pa-2 pt-1"},
-                 "content": info_content},
-            ],
+        # 卡面结构：可点击区（海报 + 文字）包在 <a> 内，订阅按钮单独成行、位于 <a> 之外
+        poster_block = {
+            "component": "div",
+            "props": {"style": "position:relative;", "class": "netflix-poster-wrap"},
+            "content": poster_inner,
         }
+        info_block = {
+            "component": "VCardText",
+            "props": {"class": "pa-2 pt-1"},
+            "content": info_content,
+        }
+        btn_block = {
+            "component": "VCardText",
+            "props": {"class": "pa-2 pt-0"},
+            "content": [sub_btn],
+        }
+
+        card_body: list[dict] = []
         if media_url:
-            # 用 <a> 包整个卡片 → SPA 内跳系统详情
-            return {
+            card_body.append({
                 "component": "a",
                 "props": {
                     "href": media_url,
@@ -857,9 +876,23 @@ class NetflixTop10(_PluginBase):
                     "class": "d-block text-decoration-none text-high-emphasis netflix-poster-link",
                     "style": "color:inherit;",
                 },
-                "content": [inner],
-            }
-        return inner
+                "content": [poster_block, info_block],
+            })
+        else:
+            card_body.extend([poster_block, info_block])
+        card_body.append(btn_block)
+
+        return {
+            "component": "VCard",
+            "props": {
+                "variant": "outlined",
+                "rounded": "lg",
+                "class": "netflix-poster-card h-100",
+                "style": ("cursor:pointer; transition: transform .15s, box-shadow .15s;"
+                          if media_url else "transition: transform .15s, box-shadow .15s;"),
+            },
+            "content": card_body,
+        }
 
     def _render_item_row(self, item: dict) -> dict:
         """渲染单个榜单条目行（保留旧版紧凑行模式，供历史兼容/未来调试使用）。"""
