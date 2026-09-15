@@ -243,7 +243,7 @@ class NetflixTop10(_PluginBase):
         "剧集/电影四分类，TMDB 识别，海报墙一键订阅，新上榜提醒，支持自动订阅。"
     )
     plugin_icon = "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_author = "hongyu7314"
     author_url = "https://github.com/hongyu7314"
     plugin_config_prefix = "netflixtop10_"
@@ -1021,14 +1021,23 @@ class NetflixTop10(_PluginBase):
         if countries:
             self.save_data(self._countries_key, {"countries": countries, "ts": time.time()})
 
-        # 与旧缓存合并：已识别的 TMDB 信息直接复用（仅当 scope 一致时）
+        # 与旧缓存合并：已识别的 TMDB 信息直接复用（仅当 scope 一致时）。
+        # 复用前先确认识别缓存里仍有该条目的有效记录，否则重新识别 ——
+        # 否则一旦某次识别错误（或识别策略升级），错误的 tmdbid/海报会被永久黏住。
         cached = self.get_data(self._cache_key)
         existing: Dict[str, dict] = {}
         if cached and isinstance(cached, dict) and cached.get("scope") == scope:
             for old in cached.get("rows", []):
+                if not old.get("tmdbid"):
+                    continue
+                probe = self._get_cached(
+                    self._tmdb_cache_key(old.get("name") or "", old.get("mtype") or "TV"),
+                    self._tmdb_cache_ttl,
+                )
+                if not probe:
+                    continue
                 key = f"{old.get('category', '')}::{old.get('name', '')}"
-                if old.get("tmdbid"):
-                    existing[key] = old
+                existing[key] = old
 
         enriched = []
         new_tmdb_count = 0
