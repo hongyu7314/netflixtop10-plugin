@@ -10,6 +10,7 @@ TMDB 识别媒体信息，支持一键订阅、新上榜提醒与自动订阅。
 
 import hashlib
 import random
+import re
 import threading
 import time
 from datetime import datetime
