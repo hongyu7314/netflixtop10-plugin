@@ -2,6 +2,11 @@
 
 MoviePilot V3 插件。基于 Netflix 官方公开的 [Tudum Top 10](https://www.netflix.com/tudum/top10) 周榜数据，覆盖 **剧集（英语/非英语）+ 电影（英语/非英语）** 共四个榜单分类。
 
+**v1.1.2 修复**：
+- 🩹 **修复历史误识别被永久黏住**：刷新时原本只要旧缓存里有 `tmdbid` 就直接复用，导致一次识别错误（如 `Shrek` 认成 *Shrek Stories*）会一直沿用。现在复用前先确认识别缓存里仍有该条目的有效记录，否则重新识别。
+- 🩹 补齐缺失的 `re` 模块导入（此前 `_NETFLIX_SUFFIX_RE` 会在导入期抛 `NameError`，插件 API 全部 404）。
+- ✅ 海报覆盖率实测：**9/40 → 37/40**（剩余未命中的 `Instadocs: The Decoy Plane` 在 TMDB 中尚无条目；`Lovesick`/`13 Minutes` 详情无海报字段）。
+
 **v1.1.1 修复**：
 - 🩹 **修复榜单条目大量识别不到海报**：原先走宿主 `TmdbApi.search_movies/search_tvs`，其内部按"查询词 ⊂ 条目中文名"过滤，而 TMDB 在 `language=zh` 下返回的是中文名（如"怪物史瑞克"），英文榜单标题永远无法命中 → 40 条里只认出 11 条。现改为直接调用 TMDB 底层搜索 + 严格标题匹配，并保留宿主识别链作为二级回退。
 - 🎯 **降低误匹配**：严格匹配阶段在"完全一致（原名/本地化名）→ 子串（取长度最接近）"之间分级；宽松兜底阶段仅在候选"近两年内发行且热度更高"时替换 TMDB 相关性第一条（修正 `The Secret Woman` 命中 2015 年老片、`Blood Sacrifice` 命中《The Celts》这类错误）。
