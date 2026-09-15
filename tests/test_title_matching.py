@@ -96,6 +96,19 @@ check("loose 无海报回退", pick("题外", noposter, MediaType.MOVIE), 7)
 
 check("空列表", pick("任何", [], MediaType.MOVIE), 0)
 
+# --- 静态检查：模块顶层用到的标准库必须已 import ---
+# 之前 _NETFLIX_SUFFIX_RE = re.compile(...) 用了 re 却没 import re，
+# 插件在容器里 import 直接 NameError（run-once 返回 404）。这里做个兜底检查。
+REQUIRED_IMPORTS = ["re", "hashlib", "random", "threading", "time"]
+for mod in REQUIRED_IMPORTS:
+    used = re.search(rf"(?<![\w.]){mod}\.", text) is not None
+    imported = re.search(rf"^import {mod}\b|^import .*\b{mod}\b", text, re.M) is not None
+    if used and not imported:
+        failures.append(f"缺少 import {mod}")
+        print(f"FAIL 模块顶层使用了 {mod}. 但没有 import {mod}")
+    else:
+        print(f"OK   导入检查 {mod}: used={used} imported={imported}")
+
 print()
 if failures:
     print(f"{len(failures)} 个用例失败：{failures}")
