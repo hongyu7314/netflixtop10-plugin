@@ -1,16 +1,19 @@
 {
   "NetflixTop10": {
+    "id": "NetflixTop10",
     "name": "网飞排行榜",
-    "description": "Netflix 官方 Tudum Top 10 周榜订阅：全球/国家维度、剧集/电影四分类，TMDB 识别，一键订阅，新上榜提醒。",
+    "description": "Netflix 官方 Tudum Top 10 周榜订阅：详情页顶部一键切换全球/中国香港/美国/韩国/日本五榜，海报墙点卡片直接跳转 MoviePilot 系统详情页，支持剧集/电影×英语/非英语四个分类，TMDB 识别，一键订阅，新上榜提醒，自动订阅。",
     "labels": "榜单,Netflix,剧集,电影",
-    "version": "1.0.0",
-    "icon": "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/Netflix_2015_logo.svg/512px-Netflix_2015_logo.svg.png",
+    "version": "1.1.1",
+    "icon": "mdi-netflix",
     "author": "hongyu7314",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
-      "v1.0.0": "首次发布：Netflix 官方 Tudum Top 10 周榜（全球 + 90+ 国家/地区），剧集/电影 × 英语/非英语四分类，TMDB 识别与三级缓存，一键订阅，新上榜提醒，自动订阅，订阅事件状态失效。"
+      "v1.0.0": "首次发布：Netflix 官方 Tudum Top 10 周榜（全球 + 90+ 国家/地区），剧集/电影 × 英语/非英语四分类，TMDB 识别与三级缓存，一键订阅，新上榜提醒，自动订阅，订阅事件状态失效。",
+      "v1.1.0": "新增海报墙（点卡片跳转系统详情页、海报放大）与全球/中国香港/美国/韩国/日本五地区一键切换。",
+      "v1.1.1": "修复榜单条目大量识别不到海报的问题：改走 TMDB 底层搜索并新增严格标题匹配，绕开宿主 TmdbApi 按中文标题子串过滤导致英文榜单被整批丢弃的逻辑；识别结果全量按 TMDB 原名/别名/Jaccard 相似度择优。"
     }
   }
 }
